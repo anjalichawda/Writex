@@ -77,17 +77,87 @@ public class HuggingFaceAIService implements AIService {
         String safeStyle = style == null ? "Informative" : style.trim();
 
         String prompt = buildChapterPrompt(safeChapterTitle, safeChapterDescription, safeStyle);
-        String llmJson = generateJsonFromPrompt(prompt, 1200);
+
+        // Get raw LLM text — bypass generateJsonFromPrompt since chapter content
+        // is long prose that breaks JSON extraction heuristics
+        String rawText = generateRawTextFromPrompt(prompt, 1200);
+
+        // 1. Try to parse as JSON first (happy path — LLM obeyed the schema)
+        try {
+            String candidate = extractFirstJsonObject(rawText);
+            JsonNode root = objectMapper.readTree(candidate);
+            JsonNode contentNode = root.get("content");
+            if (contentNode != null && contentNode.isTextual()) {
+                String extracted = contentNode.asText().trim();
+                if (!extracted.isBlank()) {
+                    return extracted;
+                }
+            }
+        } catch (Exception ignored) {
+        }
+
+        // 2. Fallback: strip any JSON wrapper fragments and return the prose directly
+        String cleaned = rawText.trim();
+        // Strip leading {"content": " and trailing "}
+        cleaned = cleaned.replaceAll("(?s)^\\{\\s*\"content\"\\s*:\\s*\"", "");
+        cleaned = cleaned.replaceAll("\"\\s*\\}\\s*$", "");
+        // Unescape JSON string escapes left behind
+        cleaned = cleaned.replace("\\n", "\n")
+                .replace("\\r", "")
+                .replace("\\\"", "\"")
+                .replace("\\\\", "\\")
+                .trim();
+
+        if (!cleaned.isBlank()) {
+            return cleaned;
+        }
+
+        throw new IllegalStateException("Failed to extract chapter content from LLM response.");
+    }
+
+    private String generateRawTextFromPrompt(String prompt, int maxNewTokens) {
+        String effectiveToken = resolveHfToken();
+        boolean hasToken = effectiveToken != null && !effectiveToken.isBlank();
+
+        String jsonBody = """
+                {
+                  "model": %s,
+                  "messages": [
+                    { "role": "user", "content": %s }
+                  ],
+                  "max_tokens": %d,
+                  "temperature": 0.7
+                }
+                """.formatted(quoteJsonString(model), quoteJsonString(prompt), maxNewTokens);
+
+        String base = hfBaseUrl.endsWith("/")
+                ? hfBaseUrl.substring(0, hfBaseUrl.length() - 1)
+                : hfBaseUrl;
+        String url = base + "/chat/completions";
+
+        HttpRequest.Builder req = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(jsonBody, StandardCharsets.UTF_8));
+
+        if (hasToken) {
+            req.header("Authorization", "Bearer " + effectiveToken);
+        }
 
         try {
-            JsonNode root = objectMapper.readTree(llmJson);
-            JsonNode contentNode = root.get("content");
-            if (contentNode == null || !contentNode.isTextual()) {
-                throw new IllegalStateException("LLM output did not contain a `content` string.");
+            HttpResponse<String> resp = httpClient.send(req.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (resp.statusCode() < 200 || resp.statusCode() >= 300) {
+                throw new IllegalStateException("LLM request failed " + resp.statusCode() + ": " + resp.body());
             }
-            return contentNode.asText();
+            JsonNode root = objectMapper.readTree(resp.body());
+            // Returns raw content string — no JSON extraction forced
+            return extractChatContent(root);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("LLM request was interrupted.", e);
         } catch (IOException e) {
-            throw new IllegalStateException("Failed to parse LLM chapter content JSON.", e);
+            throw new IllegalStateException("Failed to call Hugging Face LLM.", e);
         }
     }
 
